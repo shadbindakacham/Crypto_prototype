@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Shamir's Secret Sharing — Interactive Demo</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700;800&family=Syne:wght@600;700;800&display=swap" rel="stylesheet" />
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      background: #060a10;
+      color: #c8d8e8;
+      font-family: 'Syne', sans-serif;
+      min-height: 100vh;
+    }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #0a0e16; }
+    ::-webkit-scrollbar-thumb { background: #1e2840; border-radius: 3px; }
+    input[type=range] { -webkit-appearance: none; appearance: none; height: 4px; background: #1e2840; border-radius: 2px; outline: none; }
+    input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: #00d4ff; cursor: pointer; box-shadow: 0 0 8px rgba(0,212,255,0.5); }
+    textarea, input[type=text] { resize: vertical; }
+    * { transition: none; }
+    .anim { transition: all 0.3s ease; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useCallback, useEffect, useRef } = React;
+
+    // ── Prime field (safe prime > 2^128) ─────────────────────────────────────
+    const PRIME = 340282366920938463463374607431768211297n;
+
+    function rndBig(max) {
+      const buf = new Uint8Array(16);
+      crypto.getRandomValues(buf);
+      let n = 0n;
+      for (const b of buf) n = (n << 8n) | BigInt(b);
+      return n % max;
+    }
+    function mod(a, m) { return ((a % m) + m) % m; }
+    function modpow(base, exp, m) {
+      let r = 1n; base = mod(base, m);
+      while (exp > 0n) {
+        if (exp & 1n) r = r * base % m;
+        exp >>= 1n; base = base * base % m;
+      }
+      return r;
+    }
+    function modinv(a, m) { return modpow(mod(a, m), m - 2n, m); }
+
+    function generateShares(secret, n, k) {
+      const coeffs = [secret];
+      for (let i = 1; i < k; i++) coeffs.push(rndBig(PRIME));
+      const shares = [];
+      for (let x = 1; x <= n; x++) {
+        const X = BigInt(x);
+        let y = 0n;
+        for (let i = 0; i < k; i++) y = mod(y + coeffs[i] * modpow(X, BigInt(i), PRIME), PRIME);
+        shares.push({ x: X, y, index: x });
+      }
+      return { shares, polynomial: coeffs };
+    }
+
+    function reconstructSecret(sel) {
+      let secret = 0n;
+      for (let i = 0; i < sel.length; i++) {
+        let num = 1n, den = 1n;
+        for (let j = 0; j < sel.length; j++) {
+          if (i === j) continue;
+          num = mod(num * (0n - sel[j].x), PRIME);
+          den = mod(den * (sel[i].x - sel[j].x), PRIME);
+        }
+        secret = mod(secret + sel[i].y * num * modinv(den, PRIME), PRIME);
+      }
+      return secret;
+    }
+
+    function bigToBytes(n, len = 16) {
+      const b = new Uint8Array(len);
+      for (let i = len - 1; i >= 0; i--) { b[i] = Number(n & 0xffn); n >>= 8n; }
+      return b;
+    }
+    function bytesToBig(bytes) {
+      let n = 0n;
+      for (const b of bytes) n = (n << 8n) | BigInt(b);
+      return n;
+    }
+    function toHex(buf) {
+      return Array.from(buf).map(b => b.toString(16).padStart(2, "0")).join("");
+    }
+    function truncHex(s, len = 24) {
+      return s.length > len ? s.slice(0, len) + "…" : s;
+    }
+
+    async function aesEncrypt(msg, keyBytes) {
+      const key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(msg)));
+      return { ct, iv };
+    }
+    async function aesDecrypt(ct, iv, keyBytes) {
+      const key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["decrypt"]);
+      const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct);
+      return new TextDecoder().decode(pt);
+    }
+
+    // ── Design tokens ─────────────────────────────────────────────────────────
+    const SHARE_COLORS = [
+      ["#ff6b6b","#ff4444"], ["#ffd93d","#f5b800"], ["#6bcb77","#00b341"],
+      ["#4d96ff","#005ce6"], ["#ff9f1c","#e07000"], ["#c77dff","#9b00e8"],
+      ["#00d4ff","#0090b3"], ["#ff6b9d","#d4005a"],
+    ];
+
+    // ── Sub-components ────────────────────────────────────────────────────────
+
+    function GlowDot({ color = "#00d4ff" }) {
+      return <span style={{ display:"inline-block", width:8, height:8, borderRadius:"50%", background:color, boxShadow:`0 0 6px ${color}`, marginRight:6, flexShrink:0 }} />;
+    }
+
+    function Badge({ text, color = "#00d4ff" }) {
+      return (
+        <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:10, fontWeight:700, padding:"2px 7px", borderRadius:4, border:`1px solid ${color}`, color, background:color+"18", letterSpacing:1, textTransform:"uppercase" }}>
+          {text}
+        </span>
+      );
+    }
+
+    function DataBlock({ label, value, color = "#00d4ff" }) {
+      return (
+        <div style={{ marginBottom:12 }}>
+          <div style={{ fontSize:10, color:"#556", fontFamily:"monospace", marginBottom:4, letterSpacing:1, textTransform:"uppercase" }}>{label}</div>
+          <div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:11, color, background:"#0d1117", border:`1px solid ${color}30`, borderRadius:6, padding:"8px 12px", wordBreak:"break-all", lineHeight:1.7, boxShadow:`0 0 12px ${color}10` }}>
+            {value}
+          </div>
+        </div>
+      );
+    }
+
+    function StepCard({ number, title, active, done, children }) {
+      return (
+        <div style={{
+          background: active ? "rgba(0,212,255,0.03)" : "rgba(10,14,20,0.8)",
+          border: `1px solid ${active ? "#00d4ff40" : done ? "#00d4ff20" : "#1a2030"}`,
+          borderRadius:12, padding:"20px 24px", marginBottom:16,
+          opacity: done ? 1 : active ? 1 : 0.35,
+          boxShadow: active ? "0 0 24px rgba(0,212,255,0.06)" : "none",
+        }}>
+          <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom: (active||done) ? 16 : 0 }}>
+            <div style={{
+              width:28, height:28, borderRadius:"50%", display:"flex", alignItems:"center", justifyContent:"center",
+              background: done ? "#00d4ff" : active ? "rgba(0,212,255,0.15)" : "rgba(255,255,255,0.05)",
+              border: `2px solid ${done ? "#00d4ff" : active ? "#00d4ff60" : "#2a3040"}`,
+              fontSize:12, fontWeight:800, color: done ? "#000" : active ? "#00d4ff" : "#445",
+              fontFamily:"monospace",
+            }}>{done ? "✓" : number}</div>
+            <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:13, fontWeight:700, color: done ? "#00d4ff" : active ? "#e0e8ff" : "#445", letterSpacing:0.5 }}>{title}</span>
+            {done && <Badge text="COMPLETE" color="#00d4ff" />}
+            {active && <Badge text="ACTIVE" color="#ffd93d" />}
+          </div>
+          {(active || done) && children}
+        </div>
+      );
+    }
+
+    function SharePill({ share, selected, onToggle, disabled, color }) {
+      const [c1, c2] = color;
+      return (
+        <div onClick={() => !disabled && onToggle()} style={{
+          display:"flex", alignItems:"flex-start", gap:10,
+          padding:"12px 14px", borderRadius:10, marginBottom:10,
+          border:`1.5px solid ${selected ? c1 : "#1e2840"}`,
+          background: selected ? `${c1}12` : "rgba(10,14,20,0.6)",
+          cursor: disabled ? "default" : "pointer",
+          boxShadow: selected ? `0 0 16px ${c1}25` : "none",
+        }}>
+          <div style={{
+            width:18, height:18, borderRadius:4, border:`2px solid ${selected ? c1 : "#2a3a50"}`,
+            background: selected ? c1 : "transparent", display:"flex", alignItems:"center", justifyContent:"center",
+            flexShrink:0, marginTop:1,
+          }}>
+            {selected && <span style={{ fontSize:10, color:"#000", fontWeight:900 }}>✓</span>}
+          </div>
+          <div style={{ flex:1, minWidth:0 }}>
+            <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:5 }}>
+              <span style={{ fontSize:11, fontWeight:800, fontFamily:"monospace", color: selected ? c1 : "#5a6a80", letterSpacing:1 }}>SHARE #{share.index}</span>
+              <span style={{ fontSize:10, color:"#334", fontFamily:"monospace" }}>x = {share.x.toString()}</span>
+            </div>
+            <div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:10, color: selected ? c2 : "#3a4a60", wordBreak:"break-all", lineHeight:1.6 }}>
+              y = {truncHex(share.y.toString(16), 40)}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function PolynomialViz({ coeffs, k }) {
+      return (
+        <div style={{ background:"#080c14", border:"1px solid #1a2840", borderRadius:8, padding:"12px 16px", fontFamily:"'JetBrains Mono',monospace", fontSize:11, color:"#7a8aa0", lineHeight:2, marginBottom:12 }}>
+          <span style={{ color:"#556", fontSize:10, letterSpacing:1, textTransform:"uppercase" }}>f(x) = </span>
+          {coeffs.map((c, i) => {
+            const hex = truncHex(c.toString(16), 8);
+            if (i === 0) return <span key={i}><span style={{ color:"#00d4ff" }}>secret</span></span>;
+            if (i === 1) return <span key={i}> + <span style={{ color:"#ffd93d" }}>{hex}</span>·x</span>;
+            return <span key={i}> + <span style={{ color:SHARE_COLORS[i%SHARE_COLORS.length][0] }}>{hex}</span>·x<sup>{i}</sup></span>;
+          })}
+          <span style={{ color:"#445" }}> mod p</span>
+        </div>
+      );
+    }
+
+    // ── Timeline visual ───────────────────────────────────────────────────────
+    function Timeline({ phase }) {
+      const steps = ["INPUT", "SPLIT", "SELECT", "RESULT"];
+      return (
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:0, marginBottom:32, padding:"0 8px" }}>
+          {steps.map((s, i) => (
+            <React.Fragment key={s}>
+              <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:6 }}>
+                <div style={{
+                  width:36, height:36, borderRadius:"50%", display:"flex", alignItems:"center", justifyContent:"center",
+                  background: phase > i ? "#00d4ff" : phase === i ? "rgba(0,212,255,0.15)" : "rgba(255,255,255,0.04)",
+                  border: `2px solid ${phase > i ? "#00d4ff" : phase === i ? "#00d4ff60" : "#1a2030"}`,
+                  fontSize:14, color: phase > i ? "#000" : phase === i ? "#00d4ff" : "#334",
+                  fontWeight:800, boxShadow: phase === i ? "0 0 14px rgba(0,212,255,0.3)" : "none",
+                }}>
+                  {phase > i ? "✓" : i + 1}
+                </div>
+                <span style={{ fontSize:9, fontFamily:"monospace", letterSpacing:1, color: phase >= i ? "#00d4ff" : "#2a3040", textTransform:"uppercase" }}>{s}</span>
+              </div>
+              {i < steps.length - 1 && (
+                <div style={{ flex:1, height:2, background: phase > i ? "linear-gradient(90deg,#00d4ff,#00d4ff40)" : "#1a2030", margin:"0 4px", marginBottom:22 }} />
+              )}
+            </React.Fragment>
+          ))}
+        </div>
+      );
+    }
+
+    // ── Button helper ─────────────────────────────────────────────────────────
+    function Btn({ onClick, disabled, children, variant = "primary" }) {
+      const base = { border:"none", borderRadius:8, padding:"12px 28px", fontFamily:"'JetBrains Mono',monospace", fontSize:12, fontWeight:700, cursor: disabled ? "not-allowed" : "pointer", letterSpacing:1 };
+      const styles = {
+        primary: { background: disabled ? "#1a2030" : "linear-gradient(135deg,#00d4ff,#0052cc)", color: disabled ? "#445" : "#000", boxShadow: disabled ? "none" : "0 0 20px rgba(0,212,255,0.3)" },
+        success: { background: disabled ? "#1a2030" : "linear-gradient(135deg,#6bcb77,#005e1e)", color: disabled ? "#445" : "#000", boxShadow: disabled ? "none" : "0 0 16px rgba(107,203,119,0.3)" },
+        ghost: { background:"transparent", border:"1px solid #1e2840", color:"#445" },
+      };
+      return <button onClick={!disabled ? onClick : undefined} style={{...base, ...styles[variant]}}>{children}</button>;
+    }
+
+    // ── Main App ──────────────────────────────────────────────────────────────
+    function App() {
+      const [message, setMessage] = useState("");
+      const [n, setN] = useState(5);
+      const [k, setK] = useState(3);
+      const [phase, setPhase] = useState(0);
+      const [loading, setLoading] = useState(false);
+      const [error, setError] = useState("");
+
+      const [aesKeyHex, setAesKeyHex] = useState("");
+      const [ctHex, setCtHex] = useState("");
+      const [ivHex, setIvHex] = useState("");
+      const [rawCt, setRawCt] = useState(null);
+      const [rawIv, setRawIv] = useState(null);
+      const [shares, setShares] = useState([]);
+      const [polynomial, setPolynomial] = useState([]);
+      const [selected, setSelected] = useState({});
+      const [reconstructedKey, setReconstructedKey] = useState("");
+      const [decrypted, setDecrypted] = useState("");
+      const [selfDestroyed, setSelfDestroyed] = useState(false);
+
+      const selectedCount = Object.values(selected).filter(Boolean).length;
+
+      const handleEncrypt = useCallback(async () => {
+        if (!message.trim()) { setError("Enter a secret message first."); return; }
+        if (k > n) { setError("Threshold k cannot exceed n."); return; }
+        setError(""); setLoading(true);
+        try {
+          const keyBytes = crypto.getRandomValues(new Uint8Array(16));
+          const keyBig = bytesToBig(keyBytes);
+          const { ct, iv } = await aesEncrypt(message, keyBytes);
+          const { shares: shs, polynomial: poly } = generateShares(keyBig, n, k);
+          setAesKeyHex(toHex(keyBytes));
+          setCtHex(toHex(ct)); setIvHex(toHex(iv));
+          setRawCt(ct); setRawIv(iv);
+          setShares(shs); setPolynomial(poly);
+          setSelected({}); setPhase(1);
+        } catch (e) { setError(e.message); }
+        setLoading(false);
+      }, [message, n, k]);
+
+      const handleReconstruct = useCallback(async () => {
+        const sel = shares.filter(s => selected[s.index]);
+        if (sel.length < k) { setError(`Need ≥ ${k} shares. Selected: ${sel.length}.`); return; }
+        setError(""); setLoading(true);
+        try {
+          const recKey = reconstructSecret(sel);
+          const recKeyBytes = bigToBytes(recKey);
+          const recKeyHex = toHex(recKeyBytes);
+          setReconstructedKey(recKeyHex);
+          if (recKeyHex === aesKeyHex) {
+            const plain = await aesDecrypt(rawCt, rawIv, recKeyBytes);
+            setDecrypted(plain); setSelfDestroyed(false);
+          } else {
+            setDecrypted(""); setSelfDestroyed(true);
+          }
+        } catch(e) { setDecrypted(""); setSelfDestroyed(true); }
+        setPhase(3); setLoading(false);
+      }, [shares, selected, k, aesKeyHex, rawCt, rawIv]);
+
+      const reset = () => {
+        setPhase(0); setMessage(""); setSelected({}); setError("");
+        setShares([]); setPolynomial([]); setAesKeyHex("");
+        setCtHex(""); setDecrypted(""); setReconstructedKey(""); setSelfDestroyed(false);
+        setN(5); setK(3);
+      };
+
+      return (
+        <div style={{
+          minHeight:"100vh",
+          background:"#060a10",
+          backgroundImage:"radial-gradient(ellipse at 20% 0%,rgba(0,212,255,0.08) 0%,transparent 50%),radial-gradient(ellipse at 80% 100%,rgba(77,150,255,0.06) 0%,transparent 50%)",
+          padding:"32px 16px",
+        }}>
+          <div style={{ maxWidth:800, margin:"0 auto" }}>
+
+            {/* Header */}
+            <div style={{ textAlign:"center", marginBottom:32 }}>
+              <div style={{ display:"inline-flex", alignItems:"center", gap:10, background:"rgba(0,212,255,0.06)", border:"1px solid rgba(0,212,255,0.15)", borderRadius:100, padding:"6px 16px", marginBottom:16 }}>
+                <span style={{ fontSize:14 }}>🔐</span>
+                <span style={{ fontFamily:"monospace", fontSize:10, color:"#00d4ff", letterSpacing:2, textTransform:"uppercase" }}>Cryptography & Blockchain · CnBT Demo</span>
+              </div>
+              <h1 style={{ fontSize:"clamp(22px,5vw,36px)", fontWeight:800, background:"linear-gradient(90deg,#e8f0ff,#00d4ff)", WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent", marginBottom:8 }}>
+                Shamir's Secret Sharing
+              </h1>
+              <p style={{ fontFamily:"monospace", fontSize:11, color:"#445", lineHeight:1.7 }}>
+                AES-128-GCM encryption · Polynomial over GF(p) · k-of-n threshold reconstruction · Self-destructing access
+              </p>
+            </div>
+
+            <Timeline phase={phase} />
+
+            {/* ── STEP 1 ── */}
+            <StepCard number={1} title="Encrypt Message & Configure Shares" active={phase===0} done={phase>0}>
+              {phase === 0 ? (
+                <>
+                  <div style={{ marginBottom:16 }}>
+                    <label style={{ fontSize:10, color:"#445", fontFamily:"monospace", letterSpacing:1, textTransform:"uppercase", display:"block", marginBottom:6 }}>Secret Message</label>
+                    <textarea value={message} onChange={e=>setMessage(e.target.value)} placeholder="Type your secret message here…" rows={3} style={{ width:"100%", background:"#0d1117", border:"1.5px solid #1e2840", borderRadius:8, color:"#c8d8e8", fontFamily:"'JetBrains Mono',monospace", fontSize:13, padding:"12px 14px", outline:"none", lineHeight:1.6 }} />
+                  </div>
+
+                  <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:20, marginBottom:20 }}>
+                    {[
+                      { label:"n — Total Shares", val:n, set:setN, min:2, max:8, color:"#00d4ff", desc:`Generate ${n} key shares distributed to ${n} nodes` },
+                      { label:"k — Threshold", val:k, set:v=>setK(Math.min(v,n)), min:2, max:n, color:"#ffd93d", desc:`Any ${k} of ${n} shares reconstruct the secret` },
+                    ].map(({label,val,set,min,max,color,desc})=>(
+                      <div key={label}>
+                        <div style={{ display:"flex", justifyContent:"space-between", marginBottom:8 }}>
+                          <label style={{ fontSize:10, color:"#445", fontFamily:"monospace", letterSpacing:1, textTransform:"uppercase" }}>{label}</label>
+                          <span style={{ fontFamily:"monospace", fontSize:22, fontWeight:800, color }}>{val}</span>
+                        </div>
+                        <input type="range" min={min} max={max} value={val} onChange={e=>set(parseInt(e.target.value))} style={{ width:"100%", accentColor:color }} />
+                        <div style={{ fontSize:10, color:"#2a3a50", fontFamily:"monospace", marginTop:4 }}>{desc}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div style={{ background:"#0a0e16", border:"1px solid #1a2030", borderRadius:8, padding:"12px 16px", fontFamily:"monospace", fontSize:11, color:"#445", marginBottom:16, lineHeight:1.7 }}>
+                    <GlowDot color="#ffd93d" />
+                    Security relies on <strong style={{color:"#ffd93d"}}>polynomial interpolation</strong>. With fewer than <strong style={{color:"#ff6b6b"}}>{k}</strong> shares, <strong style={{color:"#ff6b6b"}}>zero information</strong> about the key is leaked — proven by information theory.
+                  </div>
+
+                  {error && <div style={{ color:"#ff6b6b", fontSize:11, fontFamily:"monospace", marginBottom:12 }}>⚠ {error}</div>}
+                  <Btn onClick={handleEncrypt} disabled={loading||!message.trim()}>{loading ? "⟳ ENCRYPTING…" : "⚡ ENCRYPT & SPLIT KEY"}</Btn>
+                </>
+              ) : (
+                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
+                  <DataBlock label="AES-128-GCM Key" value={aesKeyHex} color="#ffd93d" />
+                  <DataBlock label="IV (GCM Nonce)" value={ivHex} color="#c77dff" />
+                  <div style={{ gridColumn:"span 2" }}>
+                    <DataBlock label="Ciphertext" value={truncHex(ctHex, 96)} color="#ff6b6b" />
+                  </div>
+                </div>
+              )}
+            </StepCard>
+
+            {/* Arrow */}
+            <div style={{ textAlign:"center", margin:"4px 0", color:"#00d4ff40", fontSize:20 }}>↓</div>
+
+            {/* ── STEP 2 ── */}
+            <StepCard number={2} title="Polynomial & Key Shares" active={phase===1} done={phase>1}>
+              {phase >= 1 && (
+                <>
+                  <div style={{ marginBottom:14 }}>
+                    <div style={{ fontSize:10, color:"#556", fontFamily:"monospace", marginBottom:8, letterSpacing:1, textTransform:"uppercase" }}>
+                      Degree-{k-1} polynomial over GF(p) — p = 340282366…
+                    </div>
+                    <PolynomialViz coeffs={polynomial} k={k} />
+                    <div style={{ fontSize:10, color:"#2a3840", fontFamily:"monospace", lineHeight:1.8 }}>
+                      • f(0) = <span style={{color:"#ffd93d"}}>AES key</span> &nbsp;·&nbsp;
+                      Each share = point (x, f(x)) &nbsp;·&nbsp;
+                      {k} points uniquely determine f(x) via Lagrange interpolation &nbsp;·&nbsp;
+                      &lt; {k} points reveal nothing
+                    </div>
+                  </div>
+
+                  <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(210px,1fr))", gap:10, marginBottom:16 }}>
+                    {shares.map((sh, i) => {
+                      const [c1,c2] = SHARE_COLORS[i%SHARE_COLORS.length];
+                      return (
+                        <div key={sh.index} style={{ background:"#080c14", border:`1px solid ${c1}30`, borderRadius:10, padding:"12px 14px" }}>
+                          <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:8 }}>
+                            <GlowDot color={c1} />
+                            <span style={{ fontFamily:"monospace", fontSize:11, fontWeight:700, color:c1, letterSpacing:1 }}>SHARE #{sh.index}</span>
+                          </div>
+                          <div style={{ fontFamily:"monospace", fontSize:9, color:"#3a4a60", marginBottom:4 }}>x = {sh.x.toString()}</div>
+                          <div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:9, color:c2, wordBreak:"break-all", lineHeight:1.5 }}>
+                            y = {truncHex(sh.y.toString(16), 32)}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {phase === 1 && (
+                    <Btn onClick={() => setPhase(2)} variant="success">→ PROCEED TO RECONSTRUCTION</Btn>
+                  )}
+                </>
+              )}
+            </StepCard>
+
+            <div style={{ textAlign:"center", margin:"4px 0", color:"#00d4ff40", fontSize:20 }}>↓</div>
+
+            {/* ── STEP 3 ── */}
+            <StepCard number={3} title={`Select Shares to Reconstruct (need ≥ ${k})`} active={phase===2} done={phase>2}>
+              {phase >= 2 && (
+                <>
+                  {/* Progress bar */}
+                  <div style={{ background:"#0a0e16", border:"1px solid #1a2030", borderRadius:8, padding:"12px 16px", marginBottom:16, display:"flex", alignItems:"center", gap:14 }}>
+                    <div style={{ fontFamily:"monospace", fontSize:11, color:"#445", whiteSpace:"nowrap" }}>
+                      <span style={{ fontSize:18, fontWeight:800, color: selectedCount>=k ? "#6bcb77" : "#ff6b6b" }}>{selectedCount}</span>
+                      <span style={{ color:"#334" }}> / {k} needed</span>
+                    </div>
+                    <div style={{ flex:1, background:"#0d1117", borderRadius:4, height:8, overflow:"hidden" }}>
+                      <div style={{ height:"100%", borderRadius:4, width:`${Math.min((selectedCount/k)*100,100)}%`, background: selectedCount>=k ? "linear-gradient(90deg,#6bcb77,#00d4ff)" : "linear-gradient(90deg,#ff6b6b,#ffd93d)", boxShadow: selectedCount>=k ? "0 0 10px #6bcb77" : "none" }} />
+                    </div>
+                    <div style={{ fontSize:10, fontFamily:"monospace", color: selectedCount>=k ? "#6bcb77" : "#ff6b6b", whiteSpace:"nowrap" }}>
+                      {selectedCount>=k ? "✓ THRESHOLD MET" : "BELOW THRESHOLD"}
+                    </div>
+                  </div>
+
+                  <div style={{ marginBottom:16 }}>
+                    {shares.map((sh,i) => (
+                      <SharePill key={sh.index} share={sh} selected={!!selected[sh.index]} onToggle={() => setSelected(prev=>({...prev,[sh.index]:!prev[sh.index]}))} disabled={phase!==2} color={SHARE_COLORS[i%SHARE_COLORS.length]} />
+                    ))}
+                  </div>
+
+                  {phase === 2 && (
+                    <>
+                      {error && <div style={{ color:"#ff6b6b", fontSize:11, fontFamily:"monospace", marginBottom:10 }}>⚠ {error}</div>}
+                      <div style={{ display:"flex", gap:12, flexWrap:"wrap" }}>
+                        <Btn onClick={handleReconstruct} disabled={loading||selectedCount<1} variant="success">{loading ? "⟳ RECONSTRUCTING…" : "🔑 RECONSTRUCT & DECRYPT"}</Btn>
+                      </div>
+                      <div style={{ fontSize:10, color:"#2a3848", fontFamily:"monospace", marginTop:8 }}>
+                        💡 Try selecting fewer than {k} shares to simulate self-destruction
+                      </div>
+                    </>
+                  )}
+                </>
+              )}
+            </StepCard>
+
+            <div style={{ textAlign:"center", margin:"4px 0", color:"#00d4ff40", fontSize:20 }}>↓</div>
+
+            {/* ── STEP 4 ── */}
+            <StepCard number={4} title="Decryption Result" active={phase===3} done={false}>
+              {phase === 3 ? (
+                <>
+                  {selfDestroyed ? (
+                    <div style={{ background:"rgba(255,50,50,0.05)", border:"1.5px solid #ff4444", borderRadius:12, padding:"28px 24px", textAlign:"center", boxShadow:"0 0 40px rgba(255,50,50,0.1)" }}>
+                      <div style={{ fontSize:48, marginBottom:12 }}>💀</div>
+                      <div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:18, fontWeight:800, color:"#ff4444", marginBottom:10, letterSpacing:2 }}>ACCESS SELF-DESTRUCTED</div>
+                      <div style={{ fontSize:12, color:"#7a3030", fontFamily:"monospace", lineHeight:1.8, maxWidth:480, margin:"0 auto" }}>
+                        Only <strong style={{color:"#ff6b6b"}}>{selectedCount}</strong> share{selectedCount!==1?"s":""} provided — threshold requires <strong style={{color:"#ff6b6b"}}>{k}</strong>.<br/>
+                        The reconstructed value is cryptographic garbage.<br/>
+                        The ciphertext exists forever, but is <strong style={{color:"#ff4444"}}>permanently and provably unreadable.</strong><br/>
+                        No brute force. No recovery. Mathematically irrecoverable.
+                      </div>
+                      <div style={{ marginTop:20, textAlign:"left" }}>
+                        <DataBlock label="Garbage reconstruction (wrong key)" value={truncHex(reconstructedKey,48)} color="#ff4444" />
+                      </div>
+                    </div>
+                  ) : (
+                    <div style={{ background:"rgba(0,212,100,0.04)", border:"1.5px solid #00d464", borderRadius:12, padding:"24px", boxShadow:"0 0 30px rgba(0,212,100,0.08)" }}>
+                      <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:16 }}>
+                        <span style={{ fontSize:32 }}>✅</span>
+                        <div>
+                          <div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:15, fontWeight:800, color:"#6bcb77" }}>DECRYPTION SUCCESSFUL</div>
+                          <div style={{ fontSize:10, color:"#3a5a40", fontFamily:"monospace" }}>Key reconstructed via Lagrange interpolation · AES-GCM authentication passed</div>
+                        </div>
+                      </div>
+                      <DataBlock label="Reconstructed AES Key (matches original ✓)" value={reconstructedKey} color="#ffd93d" />
+                      <div style={{ marginBottom:12 }}>
+                        <div style={{ fontSize:10, color:"#556", fontFamily:"monospace", marginBottom:8, letterSpacing:1, textTransform:"uppercase" }}>Decrypted Message</div>
+                        <div style={{ background:"#0a1808", border:"1.5px solid #00d46440", borderRadius:8, padding:"18px 22px", fontFamily:"'Syne',sans-serif", fontSize:18, fontWeight:700, color:"#a0ffb0", lineHeight:1.6, boxShadow:"0 0 20px rgba(0,212,100,0.1)" }}>
+                          "{decrypted}"
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  <div style={{ marginTop:16 }}>
+                    <Btn onClick={reset} variant="ghost">↺ START NEW DEMO</Btn>
+                  </div>
+                </>
+              ) : (
+                <div style={{ fontFamily:"monospace", fontSize:11, color:"#2a3a50" }}>Result will appear here after reconstruction attempt…</div>
+              )}
+            </StepCard>
+
+            {/* Legend */}
+            <div style={{ marginTop:24, padding:"16px 20px", borderRadius:10, border:"1px solid #1a2030", background:"rgba(6,10,16,0.8)", display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))", gap:12 }}>
+              {[
+                {icon:"🔒",label:"AES-128-GCM",desc:"Authenticated encryption"},
+                {icon:"🧮",label:"Shamir SSS",desc:"Polynomial over GF(p)"},
+                {icon:"⛓",label:"k-of-n",desc:"Threshold reconstruction"},
+                {icon:"💀",label:"Self-Destruct",desc:"< k shares = unreadable"},
+              ].map(({icon,label,desc})=>(
+                <div key={label} style={{ display:"flex", gap:10, alignItems:"flex-start" }}>
+                  <span style={{ fontSize:16 }}>{icon}</span>
+                  <div>
+                    <div style={{ fontFamily:"monospace", fontSize:11, fontWeight:700, color:"#4a6070" }}>{label}</div>
+                    <div style={{ fontFamily:"monospace", fontSize:10, color:"#2a3840" }}>{desc}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ textAlign:"center", marginTop:20, fontFamily:"monospace", fontSize:10, color:"#1e2840" }}>
+              Shadbinda Kacham · 160123735112 · Cryptography & Blockchain Technology (CnBT)
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
